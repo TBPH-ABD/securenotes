@@ -27,6 +27,7 @@ import secrets
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -62,8 +63,23 @@ class Database:
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
+    @contextmanager
+    def _transaction(self):
+        """Open a connection, commit or roll back, and always close it.
+
+        `with sqlite3.connect(...)` manages the transaction but does *not*
+        close the connection — in a long-running server that leaks a file
+        descriptor on every request.
+        """
+        conn = self._connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
     def _create_schema(self) -> None:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS users (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,7 +115,7 @@ class Database:
     def create_user(self, username: str, password: str) -> int | None:
         salt = secrets.token_bytes(SALT_BYTES)
         digest = hash_password(password, salt, PBKDF2_ITERATIONS)
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             try:
                 cursor = conn.execute(
                     "INSERT INTO users (username, password_hash, salt,"
@@ -110,20 +126,20 @@ class Database:
                 return None  # username already taken
 
     def get_user(self, username: str) -> sqlite3.Row | None:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             return conn.execute(
                 "SELECT * FROM users WHERE username = ?", (username,)).fetchone()
 
     def register_failure(self, user_id: int, attempts: int) -> None:
         locked = (now() + LOCKOUT_DURATION).isoformat() \
             if attempts >= MAX_FAILED_LOGINS else None
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             conn.execute(
                 "UPDATE users SET failed_attempts = ?, locked_until = ?"
                 " WHERE id = ?", (attempts, locked, user_id))
 
     def clear_failures(self, user_id: int) -> None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             conn.execute(
                 "UPDATE users SET failed_attempts = 0, locked_until = NULL"
                 " WHERE id = ?", (user_id,))
@@ -133,7 +149,7 @@ class Database:
         """Returns (session_token, csrf_token). Only the hash is stored."""
         token = secrets.token_urlsafe(SESSION_BYTES)
         csrf = secrets.token_urlsafe(32)
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             conn.execute(
                 "INSERT INTO sessions (token_hash, user_id, csrf_token,"
                 " created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
@@ -142,7 +158,7 @@ class Database:
         return token, csrf
 
     def get_session(self, token: str) -> sqlite3.Row | None:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             row = conn.execute(
                 "SELECT s.*, u.username FROM sessions s"
                 " JOIN users u ON u.id = s.user_id"
@@ -155,23 +171,23 @@ class Database:
         return row
 
     def destroy_session(self, token: str) -> None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             conn.execute("DELETE FROM sessions WHERE token_hash = ?",
                          (token_digest(token),))
 
     def purge_expired_sessions(self) -> None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             conn.execute("DELETE FROM sessions WHERE expires_at < ?", (now_iso(),))
 
     # --- notes -------------------------------------------------------------
     def list_notes(self, user_id: int) -> list[sqlite3.Row]:
-        with self._connect() as conn:
+        with self._transaction() as conn:
             return conn.execute(
                 "SELECT * FROM notes WHERE user_id = ? ORDER BY updated_at DESC",
                 (user_id,)).fetchall()
 
     def add_note(self, user_id: int, title: str, body: str) -> None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             conn.execute(
                 "INSERT INTO notes (user_id, title, body, created_at, updated_at)"
                 " VALUES (?, ?, ?, ?, ?)",
@@ -180,7 +196,7 @@ class Database:
     def delete_note(self, note_id: int, user_id: int) -> bool:
         # The user_id in the WHERE clause is the authorisation check: a user
         # cannot delete another user's note by guessing its id (IDOR).
-        with self._lock, self._connect() as conn:
+        with self._lock, self._transaction() as conn:
             cursor = conn.execute(
                 "DELETE FROM notes WHERE id = ? AND user_id = ?",
                 (note_id, user_id))

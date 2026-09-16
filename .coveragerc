@@ -1,0 +1,23 @@
+# Coverage configuration. coverage.py is a CI-only dev tool — it is never
+# shipped with the tool, so the runtime stays dependency-free.
+[run]
+source = .
+omit =
+    tests/*
+    setup.py
+
+[report]
+# 80% is the enforced floor, chosen after measuring: every tool in this
+# portfolio sits between 81% and 97%. Raise it, never lower it.
+fail_under = 80
+show_missing = True
+skip_covered = False
+precision = 0
+
+exclude_lines =
+    pragma: no cover
+    # The CLI entry guard is exercised by running the tool, not by a unit test.
+    if __name__ == .__main__.:
+    raise SystemExit
+    # Defensive branches for conditions that cannot be provoked in a test.
+    raise NotImplementedError
